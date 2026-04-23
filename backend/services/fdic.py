@@ -160,7 +160,7 @@ def compute_ratios(fin: dict) -> dict:
     }
 
 
-def build_fdic_filter(f) -> str:
+def build_fdic_filter(f: "ScreenerFilters") -> str:
     """Convert ScreenerFilters into FDIC filter string."""
     parts = ["ACTIVE:1"]
 

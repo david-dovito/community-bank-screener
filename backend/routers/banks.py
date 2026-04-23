@@ -1,17 +1,54 @@
-from fastapi import APIRouter, HTTPException, Query
+import asyncio
+import io
+import csv
 from typing import Optional
+from fastapi import APIRouter, Query
+from fastapi.responses import StreamingResponse
 from backend.models.bank import ScreenerFilters, BankSummary
 from backend.services.fdic import (
     get_institutions,
-    get_institution,
+    get_financials,
     build_fdic_filter,
     compute_ratios,
 )
-import io
-import csv
-from fastapi.responses import StreamingResponse
 
 router = APIRouter(prefix="/banks", tags=["banks"])
+
+_RATIO_FIELDS = [
+    ("roa_min", "roa_max", "roa"),
+    ("roe_min", "roe_max", "roe"),
+    ("nim_min", "nim_max", "nim"),
+    ("efficiency_min", "efficiency_max", "efficiency_ratio"),
+    ("npl_min", "npl_max", "npl_ratio"),
+    ("loan_to_deposit_min", "loan_to_deposit_max", "loan_to_deposit"),
+]
+
+
+def _has_ratio_filters(f: ScreenerFilters) -> bool:
+    return any(
+        getattr(f, lo) is not None or getattr(f, hi) is not None
+        for lo, hi, _ in _RATIO_FIELDS
+    ) or f.tier1_min is not None
+
+
+def _passes_ratio_filters(ratios: dict, f: ScreenerFilters) -> bool:
+    for lo_attr, hi_attr, key in _RATIO_FIELDS:
+        lo = getattr(f, lo_attr)
+        hi = getattr(f, hi_attr)
+        if lo is None and hi is None:
+            continue
+        val = ratios.get(key)
+        if val is None:
+            return False
+        if lo is not None and val < lo:
+            return False
+        if hi is not None and val > hi:
+            return False
+    if f.tier1_min is not None:
+        t1 = ratios.get("tier1_ratio")
+        if t1 is None or t1 < f.tier1_min:
+            return False
+    return True
 
 
 @router.post("/screen")
@@ -20,33 +57,53 @@ async def screen_banks(filters: ScreenerFilters):
     fdic_filter = build_fdic_filter(filters)
     sort_map = {
         "asset": "ASSET",
-        "roa": "ASSET",  # FDIC can't sort by ratio; we sort post-fetch
+        "roa": "ASSET",  # FDIC can't sort by ratio; sort post-fetch
         "name": "NAME",
         "state": "STNAME",
     }
     sort_by = sort_map.get(filters.sort_by, "ASSET")
+    use_ratio_filter = _has_ratio_filters(filters)
+
+    # Over-fetch more when ratio-filtering so we have enough after post-filter
+    prefetch = min(filters.limit * 5, 200) if use_ratio_filter else min(filters.limit * 3, 500)
 
     data = await get_institutions(
         filters=fdic_filter,
         sort_by=sort_by,
         sort_order=filters.sort_dir.upper(),
-        limit=min(filters.limit * 3, 500),  # over-fetch so ratio filters work
+        limit=prefetch,
         offset=filters.offset,
     )
 
     rows = [r["data"] for r in data.get("data", [])]
     total = data.get("meta", {}).get("total", len(rows))
 
-    # Attach latest financials for each bank (batch — one call per bank is too slow;
-    # we use the screener endpoint which includes aggregate fields in FDIC institutions)
+    ratio_map: dict = {}
+    if use_ratio_filter:
+        sem = asyncio.Semaphore(50)
+
+        async def fetch_ratios(cert: int) -> tuple[int, dict]:
+            async with sem:
+                try:
+                    fins = await get_financials(cert, limit=1)
+                    return cert, compute_ratios(fins[0]) if fins else {}
+                except Exception:
+                    return cert, {}
+
+        certs = [r["CERT"] for r in rows if r.get("CERT")]
+        results_pairs = await asyncio.gather(*[fetch_ratios(c) for c in certs])
+        ratio_map = dict(results_pairs)
+
     results = []
     for row in rows:
-        ratios: dict = {}
-        # FDIC institutions endpoint doesn't include income statement data,
-        # so ratios here come from pre-computed fields if available or are None.
-        # Full ratios available on /banks/{cert} via financials endpoint.
-        bank = {
-            "cert": row.get("CERT"),
+        cert = row.get("CERT")
+        ratios = ratio_map.get(cert, {})
+
+        if use_ratio_filter and not _passes_ratio_filters(ratios, filters):
+            continue
+
+        results.append({
+            "cert": cert,
             "name": row.get("NAME"),
             "city": row.get("CITY"),
             "stname": row.get("STNAME"),
@@ -57,8 +114,9 @@ async def screen_banks(filters: ScreenerFilters):
             "specgrp": row.get("SPECGRP"),
             "active": row.get("ACTIVE", 1) == 1,
             **ratios,
-        }
-        results.append(bank)
+        })
+        if len(results) >= filters.limit:
+            break
 
     return {"total": total, "data": results}
 
@@ -71,7 +129,6 @@ async def export_banks(
     limit: int = Query(default=500, le=2000),
 ):
     """Export screener results to CSV."""
-    from backend.models.bank import ScreenerFilters
     f = ScreenerFilters(
         state=[state] if state else None,
         asset_min=asset_min,
